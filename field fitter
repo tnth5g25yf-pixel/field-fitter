@@ -1,0 +1,52 @@
+import express from 'express';
+import crypto from 'crypto';
+import bcrypt from 'bcryptjs';
+import pg from 'pg';
+import Stripe from 'stripe';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __dirname=path.dirname(fileURLToPath(import.meta.url));
+const app=express();
+const PORT=process.env.PORT||3000;
+const DATABASE_URL=process.env.DATABASE_URL;
+const stripe=process.env.STRIPE_SECRET_KEY?new Stripe(process.env.STRIPE_SECRET_KEY):null;
+const pool=DATABASE_URL?new pg.Pool({connectionString:DATABASE_URL,ssl:process.env.NODE_ENV==='production'?{rejectUnauthorized:false}:false}):null;
+
+async function db(){
+ if(!pool) throw new Error('DATABASE_URL is not configured');
+ await pool.query(`CREATE TABLE IF NOT EXISTS users(id BIGSERIAL PRIMARY KEY,email TEXT UNIQUE NOT NULL,password_hash TEXT NOT NULL,paid BOOLEAN NOT NULL DEFAULT FALSE,created_at TIMESTAMPTZ DEFAULT NOW());
+ CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY,user_id BIGINT REFERENCES users(id) ON DELETE CASCADE,expires_at TIMESTAMPTZ NOT NULL);
+ CREATE TABLE IF NOT EXISTS user_data(user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,data JSONB NOT NULL DEFAULT '{}'::jsonb);`);
+}
+const hash=t=>crypto.createHash('sha256').update(t).digest('hex');
+const token=()=>crypto.randomBytes(32).toString('hex');
+async function currentUser(req){const t=req.headers.cookie?.match(/ff_session=([^;]+)/)?.[1];if(!t||!pool)return null;const r=await pool.query('SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=$1 AND s.expires_at>NOW()',[hash(t)]);return r.rows[0]||null;}
+async function requireUser(req,res,next){const u=await currentUser(req);if(!u)return res.status(401).json({error:'Login required'});req.user=u;next();}
+
+// Stripe webhook must receive the raw request body.
+app.post('/api/stripe/webhook',express.raw({type:'application/json'}),async(req,res)=>{
+ try{
+  if(!stripe||!process.env.STRIPE_WEBHOOK_SECRET)return res.sendStatus(200);
+  const event=stripe.webhooks.constructEvent(req.body,req.headers['stripe-signature'],process.env.STRIPE_WEBHOOK_SECRET);
+  if(event.type==='checkout.session.completed'){
+   const s=event.data.object; const email=s.customer_details?.email?.toLowerCase();
+   if(email) await pool.query('UPDATE users SET paid=true WHERE email=$1',[email]);
+  }
+  res.json({received:true});
+ }catch(e){res.status(400).send(`Webhook Error: ${e.message}`)}
+});
+
+app.use(express.json({limit:'1mb'}));
+app.use(express.static(path.join(__dirname,'public')));
+
+app.get('/api/me',async(req,res)=>{const u=await currentUser(req);res.json(u?{id:u.id,email:u.email,paid:u.paid}:{user:null});});
+app.post('/api/register',async(req,res)=>{try{const email=String(req.body.email||'').trim().toLowerCase(),password=String(req.body.password||'');if(!/^\S+@\S+\.\S+$/.test(email)||password.length<8)return res.status(400).json({error:'Use a valid email and a password of at least 8 characters.'});const ph=await bcrypt.hash(password,12);const r=await pool.query('INSERT INTO users(email,password_hash) VALUES($1,$2) RETURNING id,email,paid',[email,ph]);const t=token();await pool.query('INSERT INTO sessions VALUES($1,$2,NOW()+INTERVAL \'30 days\')',[hash(t),r.rows[0].id]);res.setHeader('Set-Cookie',`ff_session=${t}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=2592000`);res.json(r.rows[0]);}catch(e){res.status(400).json({error:e.code==='23505'?'An account already exists for that email.':'Registration failed.'})}});
+app.post('/api/login',async(req,res)=>{const email=String(req.body.email||'').trim().toLowerCase(),password=String(req.body.password||'');const r=await pool.query('SELECT * FROM users WHERE email=$1',[email]);if(!r.rows[0]||!(await bcrypt.compare(password,r.rows[0].password_hash)))return res.status(401).json({error:'Invalid email or password.'});const t=token();await pool.query('INSERT INTO sessions VALUES($1,$2,NOW()+INTERVAL \'30 days\')',[hash(t),r.rows[0].id]);res.setHeader('Set-Cookie',`ff_session=${t}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=2592000`);res.json({id:r.rows[0].id,email,paid:r.rows[0].paid});});
+app.post('/api/logout',async(req,res)=>{const t=req.headers.cookie?.match(/ff_session=([^;]+)/)?.[1];if(t)await pool?.query('DELETE FROM sessions WHERE token_hash=$1',[hash(t)]);res.setHeader('Set-Cookie','ff_session=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0');res.json({ok:true});});
+app.get('/api/data',requireUser,async(req,res)=>{const r=await pool.query('SELECT data FROM user_data WHERE user_id=$1',[req.user.id]);res.json(r.rows[0]?.data||{});});
+app.put('/api/data',requireUser,async(req,res)=>{await pool.query(`INSERT INTO user_data(user_id,data) VALUES($1,$2) ON CONFLICT(user_id) DO UPDATE SET data=EXCLUDED.data`,[req.user.id,req.body]);res.json({ok:true});});
+app.post('/api/checkout',requireUser,async(req,res)=>{if(!stripe)return res.status(503).json({error:'Stripe is not configured yet.'});if(req.user.paid)return res.json({url:'/'});const session=await stripe.checkout.sessions.create({mode:'payment',customer_email:req.user.email,line_items:[{price_data:{currency:'usd',product_data:{name:'FitterField Pro',description:'Digital field toolkit for fire sprinkler professionals.'},unit_amount:2999},quantity:1}],metadata:{user_id:String(req.user.id)},success_url:`${process.env.APP_URL||`http://localhost:${PORT}`}/?payment=success`,cancel_url:`${process.env.APP_URL||`http://localhost:${PORT}`}/?payment=cancelled`});res.json({url:session.url});});
+app.get('*',(req,res)=>res.sendFile(path.join(__dirname,'public','index.html')));
+
+(async()=>{try{if(pool)await db();app.listen(PORT,()=>console.log(`FitterField listening on ${PORT}`));}catch(e){console.error(e);process.exit(1)}})();
